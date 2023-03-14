@@ -1,84 +1,114 @@
-use std::io::{stdin};
+use git2::{BranchType, MergeOptions, Repository};
+use std::io::{self, Write};
+use git2::FileMode::Tree;
 
-use git2::{BranchType, Cred, FetchOptions, MergeOptions, RemoteCallbacks, Repository};
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Open the current repository
+    let repo = Repository::open(".")?;
 
-fn main() {
-    // Open the Git repository in the current directory
-    let repo = Repository::open(".").expect("Current directory is not a repository");
+    // Get the current branch name
+    let head_ref = repo.head()?;
+    let branch_head = repo.find_annotated_commit(head_ref.target().unwrap())?;
+    let branch_name = head_ref.shorthand().unwrap();
 
-    // Get the name of the current branch
-    let head = repo.head().expect("No HEAD found");
-    let current_branch = head.shorthand().unwrap();
-
-    // Ask for confirmation to merge the current branch
-    let mut confirm = String::new();
-    print!(
-        "🤔 Are you sure you want to merge branch {}? [y/n] ",
-        current_branch
-    );
-    stdin().read_line(&mut confirm).unwrap();
-    if confirm.trim() != "y" {
-        println!("🚫 Merge cancelled");
-        return;
+    // Ask the user for confirmation if the current branch is to be merged
+    print!("Do you want to merge {}? (y/n) ", branch_name);
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    if input.trim() != "y" {
+        println!("Aborting merge.👋");
+        return Ok(());
     }
 
     // Change to the main branch
-    let main_branch = "main";
-    let (object, reference) = repo
-        .revparse_ext(main_branch)
-        .expect("Main branch not found");
+    let main_branch = repo.find_branch("main", BranchType::Local)?;
+    repo.set_head(main_branch.get().name().unwrap())?;
 
-    repo.checkout_tree(&object, None)
-        .expect("Failed to checkout");
+    // Check the result of the merge
+    let (merge_analysis, _merge_preferences) = repo.merge_analysis(&[&branch_head])?;
 
-    match reference {
-        // gref is an actual reference like branches or tags
-        Some(gref) => repo.set_head(gref.name().unwrap()),
-        // this is a commit, not a reference
-        None => repo.set_head_detached(object.id()),
+    if !merge_analysis.is_fast_forward() && !merge_analysis.is_normal() {
+        println!("Merge failed.😢");
+        return Err("Merge failed".into());
     }
-    .expect("Failed to set HEAD");
 
-    // Merge the previously accepted branch
-    let merge_refname = format!("refs/heads/{}", current_branch);
-    let merge_ref = repo.find_reference(&merge_refname).expect("Failed to get reference");
-    let merge_commit = repo.reference_to_annotated_commit(&merge_ref).expect("Failed to get commit");
-    let mut merge_options = MergeOptions::new();
-    merge_options.fail_on_conflict(true);
-    merge_options.find_renames(true);
-    let analysis = repo.merge_analysis(&[&merge_commit]).expect("Failed to analyze merge");
-    if analysis.0.is_up_to_date() {
-        println!("👍 Branch is already up-to-date");
-        return;
-    } else if !analysis.0.is_fast_forward() {
-        println!("❌ Merge is not a fast-forward");
-        return;
+    let branch_commit = repo.find_commit(branch_head.target().unwrap())?;
+
+    if merge_analysis.is_fast_forward() {
+        println!("Fast-forward merge.🚀");
+
+        repo.branch("refs/heads/main", &branch_commit, true)?;
+    } else if merge_analysis.is_normal() {
+        println!("Normal merge.👍");
+
+        // Normal merge: need to create a commit object and update HEAD
+        let signature = repo.signature()?;
+        let main_commit = repo.find_commit(main_branch.get().target().unwrap())?;
+
+        repo.merge(&[&branch_head], None, None)?;
+
+        if repo.index().unwrap().has_conflicts() {
+            println!("Merge failed with merge conflicts.😢");
+            return Err("Merge failed".into());
+        }
+
+        // Create a commit object with two parents
+        let _commit_id = repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            &format!("Merge {} into main", branch_name),
+            &local_tree,
+            &[&branch_commit, &main_commit],
+        )?;
+
+        repo.cleanup_state()?;
     }
-    repo.merge(&[&merge_commit], Some(&mut merge_options), None).expect("Failed to merge");
-
     // Push the result
-    let mut remote = repo.find_remote("origin").expect("Failed to find remote");
-    let mut cb = RemoteCallbacks::new();
-    let cred = Cred::ssh_key_from_agent("git").expect("Failed to get SSH key from agent");
-    cb.credentials(|_, _, _| Ok(cred));
-    let mut fetch_options = FetchOptions::new();
-    fetch_options.remote_callbacks(cb);
-    remote.fetch(&[], Some(&mut fetch_options), None).expect("Failed to fetch");
-    let refspec = format!(
-        "refs/heads/{}:refs/heads/{}",
-        main_branch,
-        main_branch
-    );
-    let mut push_options = git2::PushOptions::new();
-    push_options.remote_callbacks(cb);
-    remote.push(&[&refspec], Some(&mut push_options)).expect("Failed to push");
+    push_to_origin(&repo)?;
+    // Delete remote and local branches
+    delete_remote_branch(&repo, &branch_name)?;
+    delete_local_branch(&repo, &branch_name)?;
 
-    // Delete the branch at origin
-    remote.delete(&[&merge_refname]).expect("Failed to delete remote branch");
+    Ok(())
+}
 
-    // Delete the local branch
-    let mut branch = repo.find_branch(&current_branch, BranchType::Local).expect("Failed to find branch");
-    branch.delete().expect("Failed to delete local branch");
+// Helper function to push changes to origin
+fn push_to_origin(repo: &Repository) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Pushing changes to origin...");
+    let mut remote = repo.find_remote("origin")?;
+    remote.push(
+        &[String::from("refs/heads/main")],
+        Some(git2::PushOptions::new()),
+    )?;
+    println!("Push successful!✅");
+    Ok(())
+}
 
-    println!("🎉 Branch {} merged successfully", current_branch);
+// Helper function to delete remote branch
+fn delete_remote_branch(
+    repo: &Repository,
+    branch_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Deleting remote branch {}...", branch_name);
+    let mut remote = repo.find_remote("origin")?;
+    remote.push(
+        &[format!(":{}", branch_name)],
+        Some(git2::PushOptions::new()),
+    )?;
+    println!("Remote branch deleted!🗑️");
+    Ok(())
+}
+
+// Helper function to delete local branch
+fn delete_local_branch(
+    repo: &Repository,
+    branch_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Deleting local branch {}...", branch_name);
+    let mut branch = repo.find_branch(branch_name, BranchType::Local)?;
+    branch.delete()?;
+    println!("Local branch deleted!🗑️");
+    Ok(())
 }
